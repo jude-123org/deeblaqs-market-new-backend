@@ -6,6 +6,7 @@ const helmet = require("helmet");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(express.json({ limit: "100kb" }));
 
@@ -103,23 +104,48 @@ app.get("/api/products", requireDb, async (req, res) => {
   res.json({ products: data || [] });
 });
 
+const authClient = () =>
+  createClient(supabaseUrl, serviceRoleKey, { auth: { autoRefreshToken: false, persistSession: false } });
+const hits = new Map();
+function limited(key, max = 5, windowMs = 15 * 60 * 1000) {
+  const now = Date.now();
+  const list = (hits.get(key) || []).filter((t) => now - t < windowMs);
+  list.push(now);
+  hits.set(key, list);
+  return list.length > max;
+}
+const strongPassword = (p) => p.length >= 8 && p.length <= 72 && /[A-Za-z]/.test(p) && /\d/.test(p);
+const PASS_MSG = "Password must be at least 8 characters and include both letters and numbers.";
+const cleanEmail = (v) => String(v || "").trim().toLowerCase();
+
 app.post("/api/auth/signup", requireDb, async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
+  const first = String(req.body?.first_name || "").trim().slice(0, 60);
+  const last = String(req.body?.last_name || "").trim().slice(0, 60);
+  const phone = String(req.body?.phone || "").trim().replace(/[\s-]/g, "");
+  const email = cleanEmail(req.body?.email);
   const password = String(req.body?.password || "");
-  if (!email || !email.includes("@") || password.length < 8) {
-    return res.status(400).json({ error: "Enter a valid email and a password of at least 8 characters." });
-  }
+  if (!first || !last) return res.status(400).json({ error: "First name and last name are required." });
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address." });
+  if (phone && !/^\+?\d{7,15}$/.test(phone)) return res.status(400).json({ error: "Enter a valid phone number or leave it empty." });
+  if (!strongPassword(password)) return res.status(400).json({ error: PASS_MSG });
 
   const { data, error } = await db.auth.admin.createUser({
     email,
     password,
-    email_confirm: false
+    email_confirm: true,
+    user_metadata: { first_name: first, last_name: last, phone: phone || null }
   });
-  if (error) return res.status(400).json({ error: error.message });
+  if (error) {
+    const exists = /already|registered|exists/i.test(error.message);
+    return res.status(400).json({ error: exists ? "An account with this email already exists." : error.message });
+  }
 
   const { error: profileError } = await db.from("profiles").upsert({
     id: data.user.id,
     email,
+    first_name: first,
+    last_name: last,
+    phone: phone || null,
     balance: 0,
     is_admin: false
   }, { onConflict: "id" });
@@ -128,19 +154,16 @@ app.post("/api/auth/signup", requireDb, async (req, res) => {
     await db.auth.admin.deleteUser(data.user.id);
     return res.status(500).json({ error: "Could not create the customer profile." });
   }
-
-  res.status(201).json({
-    message: "Account created. Check your email if email confirmation is enabled.",
-    user: { id: data.user.id, email: data.user.email }
-  });
+  res.status(201).json({ message: "Account created. You can log in now.", user: { id: data.user.id, email } });
 });
 
 app.post("/api/auth/login", requireDb, async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
+  const email = cleanEmail(req.body?.email);
   const password = String(req.body?.password || "");
   if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
+  if (limited("l:" + email, 10)) return res.status(429).json({ error: "Too many attempts. Try again in a few minutes." });
 
-  const { data, error } = await db.auth.signInWithPassword({ email, password });
+  const { data, error } = await authClient().auth.signInWithPassword({ email, password });
   if (error) return res.status(401).json({ error: "Email or password is incorrect." });
 
   res.json({
@@ -151,10 +174,37 @@ app.post("/api/auth/login", requireDb, async (req, res) => {
   });
 });
 
+/* Forgot password: step 1 sends a code to the email, step 2 checks it and sets a new password */
+app.post("/api/auth/forgot", requireDb, async (req, res) => {
+  const email = cleanEmail(req.body?.email);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address." });
+  if (limited("f:" + email, 3) || limited("fi:" + req.ip, 10)) {
+    return res.status(429).json({ error: "Too many requests. Try again in a few minutes." });
+  }
+  await authClient().auth.resetPasswordForEmail(email);
+  res.json({ message: "If this email has an account, a code has been sent. Check your inbox and spam." });
+});
+
+app.post("/api/auth/reset", requireDb, async (req, res) => {
+  const email = cleanEmail(req.body?.email);
+  const code = String(req.body?.code || "").trim();
+  const password = String(req.body?.password || "");
+  if (!/^\d{6,10}$/.test(code)) return res.status(400).json({ error: "Enter the numeric code from your email." });
+  if (!strongPassword(password)) return res.status(400).json({ error: PASS_MSG });
+  if (limited("r:" + email, 5)) return res.status(429).json({ error: "Too many attempts. Request a new code later." });
+
+  const { data, error } = await authClient().auth.verifyOtp({ email, token: code, type: "recovery" });
+  if (error || !data?.user) return res.status(400).json({ error: "The code is wrong or has expired." });
+
+  const { error: updateError } = await db.auth.admin.updateUserById(data.user.id, { password });
+  if (updateError) return res.status(500).json({ error: "Could not set the new password." });
+  res.json({ message: "Password changed. You can log in now." });
+});
+
 app.get("/api/me", requireDb, authenticate, async (req, res) => {
   const { data, error } = await db
     .from("profiles")
-    .select("id,email,balance,is_admin")
+    .select("id,email,first_name,last_name,phone,balance,is_admin")
     .eq("id", req.user.id)
     .maybeSingle();
 
