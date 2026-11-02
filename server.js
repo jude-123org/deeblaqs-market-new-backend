@@ -285,7 +285,7 @@ app.post("/api/orders", requireDb, authenticate, async (req, res) => {
   if (error) return res.status(500).json({ error: "Could not check products." });
   let total = 0; const lines = [];
   for (const i of items) {
-    const p = (prods || []).find((x) => x.id === i.product_id);
+    const p = (prods || []).find((x) => String(x.id) === String(i.product_id));
     const qty = Math.max(1, Math.min(20, parseInt(i.qty, 10) || 1));
     if (!p) return res.status(400).json({ error: "A product in your cart is no longer available." });
     total += Number(p.price) * qty; lines.push({ product_id: p.id, name: p.name, price: p.price, qty });
