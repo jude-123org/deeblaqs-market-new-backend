@@ -78,7 +78,7 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/categories", requireDb, async (_req, res) => {
+app.get("/api/categories", requireDb, authenticate, async (_req, res) => {
   const { data, error } = await db
     .from("categories")
     .select("id,name,sort,is_active")
@@ -89,7 +89,7 @@ app.get("/api/categories", requireDb, async (_req, res) => {
   res.json({ categories: data || [] });
 });
 
-app.get("/api/products", requireDb, async (req, res) => {
+app.get("/api/products", requireDb, authenticate, async (req, res) => {
   let query = db
     .from("products")
     .select("id,category_id,name,price,image_url,description,available,is_active,created_at")
