@@ -92,7 +92,7 @@ app.get("/api/categories", requireDb, authenticate, async (_req, res) => {
 app.get("/api/products", requireDb, authenticate, async (req, res) => {
   let query = db
     .from("products")
-    .select("id,category_id,name,price,image_url,description,available,is_active,created_at")
+    .select("id,category_id,name,price,image_url,description,available,is_active,plans,created_at")
     .eq("is_active", true)
     .eq("available", true)
     .order("created_at", { ascending: false });
@@ -222,6 +222,13 @@ const cleanProduct = (b) => {
   if (d.price !== undefined) d.price = Number(d.price);
   if (d.image_url !== undefined) d.image_url = String(d.image_url).trim().slice(0, 500);
   if (d.description !== undefined) d.description = String(d.description).slice(0, 500);
+  if (b?.plans !== undefined) {
+    const arr = Array.isArray(b.plans) ? b.plans : [];
+    d.plans = arr.slice(0, 10)
+      .map((p) => ({ label: String(p?.label || "").trim().slice(0, 40), price: Number(p?.price) }))
+      .filter((p) => p.label && p.price >= 0);
+    if (d.plans.length) d.price = Math.min(...d.plans.map((p) => p.price));
+  }
   return d;
 };
 
@@ -281,16 +288,23 @@ app.post("/api/orders", requireDb, authenticate, async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 50) : [];
   if (!items.length) return res.status(400).json({ error: "Your cart is empty." });
   const ids = items.map((i) => i.product_id);
-  const { data: prods, error } = await db.from("products").select("id,name,price").in("id", ids).eq("is_active", true).eq("available", true);
+  const { data: prods, error } = await db.from("products").select("id,name,price,plans").in("id", ids).eq("is_active", true).eq("available", true);
   if (error) return res.status(500).json({ error: "Could not check products." });
   let total = 0; const lines = [];
   for (const i of items) {
     const p = (prods || []).find((x) => String(x.id) === String(i.product_id));
     const qty = Math.max(1, Math.min(20, parseInt(i.qty, 10) || 1));
     if (!p) return res.status(400).json({ error: "A product in your cart is no longer available." });
-    total += Number(p.price) * qty; lines.push({ product_id: p.id, name: p.name, price: p.price, qty });
+    let price = Number(p.price), name = p.name;
+    const plans = Array.isArray(p.plans) ? p.plans : [];
+    if (plans.length) {
+      const plan = plans.find((x) => x.label === i.plan);
+      if (!plan) return res.status(400).json({ error: "Please choose a plan for " + p.name + "." });
+      price = Number(plan.price); name = p.name + " (" + plan.label + ")";
+    }
+    total += price * qty; lines.push({ product_id: p.id, name, price, qty });
   }
-  const { error: rpcErr } = await db.rpc("place_order", { p_user: req.user.id, p_items: lines, p_total: total });
+  const { error: rpcErr } = await db.rpc("place_order", { p_user: req.user.id, p_items: lines, p_total: total, p_note: String(req.body?.note || "").trim().slice(0, 300) || null });
   if (rpcErr) return res.status(400).json({ error: /insufficient/i.test(rpcErr.message) ? "Insufficient balance. Deposit funds first." : "Could not place order." });
   res.status(201).json({ ok: true, total });
 });
@@ -319,6 +333,24 @@ app.get("/api/admin/orders", admin, async (_req, res) => {
 app.put("/api/admin/orders/:id/deliver", admin, async (req, res) => {
   const { error } = await db.from("orders").update({ status: "delivered" }).eq("id", req.params.id);
   ok(res, error, { delivered: true }, "Could not update order.");
+});
+
+/* ---------- Customer feedback (public read, admin write) ---------- */
+app.get("/api/reviews", requireDb, async (_req, res) => {
+  const { data, error } = await db.from("reviews").select("id,name,message,rating,created_at").order("created_at", { ascending: false }).limit(30);
+  ok(res, error, { reviews: data || [] }, "Could not load feedback.");
+});
+app.post("/api/admin/reviews", admin, async (req, res) => {
+  const name = String(req.body?.name || "").trim().slice(0, 60);
+  const message = String(req.body?.message || "").trim().slice(0, 300);
+  const rating = Math.max(1, Math.min(5, parseInt(req.body?.rating, 10) || 5));
+  if (!name || !message) return res.status(400).json({ error: "Name and message are required." });
+  const { data, error } = await db.from("reviews").insert({ name, message, rating }).select().single();
+  ok(res, error, { review: data }, "Could not save feedback.");
+});
+app.delete("/api/admin/reviews/:id", admin, async (req, res) => {
+  const { error } = await db.from("reviews").delete().eq("id", req.params.id);
+  ok(res, error, { deleted: true }, "Could not delete feedback.");
 });
 
 app.use((err, _req, res, _next) => {
