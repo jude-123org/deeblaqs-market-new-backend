@@ -327,6 +327,188 @@ app.post("/api/admin/deposits/:id/reject", admin, async (req, res) => {
   ok(res, error, { rejected: true }, "Could not reject.");
 });
 app.get("/api/admin/orders", admin, async (_req, res) => {
+  const { data, error } = await db.from("orders").select("*, profiles(email,first_name,last_name,phone)").order("created_at", { ascending: false }).limit(200);
+  ok(res, error, { orders: data || [] }, "Could not load orders.");
+});
+app.put("/api/admin/orders/:id/deliver", admin, async (req, res) => {
+  const delivery = String(req.body?.delivery || "").trim().slice(0, 2000);
+  const { error } = await db.from("orders").update({ status: "delivered", delivery: delivery || null, delivered_at: new Date().toISOString() }).eq("id", req.params.id);
+  ok(res, error, { delivered: true }, "Could not update order.");
+});
+
+/* ---------- Flutterwave online payments (wallet funding) ---------- */
+const FLW_BASE = "https://api.flutterwave.com/v3";
+const flwKey = process.env.FLW_SECRET_KEY;
+async function flw(path, options = {}) {
+  const r = await fetch(FLW_BASE + path, {
+    ...options,
+    headers: { Authorization: "Bearer " + flwKey, "Content-Type": "application/json" }
+  });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok, j };
+}
+async function creditByRef(txRef) {
+  const v = await flw("/transactions/verify_by_reference?tx_ref=" + encodeURIComponent(txRef));
+  const t = v.j?.data;
+  if (!v.ok || !t) return { credited: false, status: "not found" };
+  if (t.status !== "successful" || t.currency !== "NGN") return { credited: false, status: String(t.status || "unknown") };
+  const { data: dep } = await db.from("deposits").select("*").eq("reference", txRef).maybeSingle();
+  if (!dep) return { credited: false, status: "unknown reference" };
+  if (Number(t.amount) < Number(dep.amount)) return { credited: false, status: "amount mismatch" };
+  if (dep.status !== "pending") return { credited: false, status: dep.status };
+  const { error } = await db.rpc("approve_deposit", { p_id: dep.id });
+  return { credited: !error, status: error ? "pending" : "successful" };
+}
+app.get("/api/payments/config", (_req, res) => res.json({ online: Boolean(flwKey) }));
+app.post("/api/payments/start", requireDb, authenticate, async (req, res) => {
+  if (!flwKey) return res.status(503).json({ error: "Online payment is not available yet. Please use bank transfer." });
+  const amount = Math.round(Number(req.body?.amount));
+  if (!(amount >= 100) || amount > 2000000) return res.status(400).json({ error: "Enter an amount from ₦100 to ₦2,000,000." });
+  if (limited("pay:" + req.user.id, 10)) return res.status(429).json({ error: "Too many attempts. Try again in a few minutes." });
+  const txRef = "dbm-" + String(req.user.id).slice(0, 8) + "-" + Date.now();
+  const { error: depError } = await db.from("deposits").insert({ user_id: req.user.id, amount, reference: txRef, status: "pending" });
+  if (depError) return res.status(500).json({ error: "Could not start the payment." });
+  const redirect = process.env.PAYMENT_REDIRECT_URL || allowedOrigins[0] || "";
+  const r = await flw("/payments", {
+    method: "POST",
+    body: JSON.stringify({
+      tx_ref: txRef, amount, currency: "NGN", redirect_url: redirect,
+      customer: { email: req.user.email },
+      customizations: { title: "DeeBlaq's Market", description: "Wallet funding" }
+    })
+  });
+  const link = r.j?.data?.link;
+  if (!r.ok || !link) return res.status(502).json({ error: "Could not open the payment page. Please try again." });
+  res.json({ link, tx_ref: txRef });
+});
+app.get("/api/payments/verify", requireDb, authenticate, async (req, res) => {
+  const txRef = String(req.query?.tx_ref || "");
+  const { data: dep } = await db.from("deposits").select("id,user_id").eq("reference", txRef).maybeSingle();
+  if (!dep || dep.user_id !== req.user.id) return res.status(404).json({ error: "Payment not found." });
+  res.json(await creditByRef(txRef));
+});
+app.post("/api/webhooks/flutterwave", requireDb, async (req, res) => {
+  const hash = process.env.FLW_SECRET_HASH;
+  if (!hash || req.get("verif-hash") !== hash) return res.status(401).end();
+  const txRef = req.body?.data?.tx_ref || req.body?.txRef;
+  if (txRef) { try { await creditByRef(String(txRef)); } catch (e) { console.error("webhook error"); } }
+  res.status(200).end();
+});
+
+/* ---------- Customer feedback (public read, admin write) ---------- */
+app.get("/api/reviews", requireDb, async (_req, res) => {
+  const { data, error } = await db.from("reviews").select("id,name,message,rating,created_at").order("created_at", { ascending: false }).limit(30);
+  ok(res, error, { reviews: data || [] }, "Could not load feedback.");
+});
+app.post("/api/admin/reviews", admin, async (req, res) => {
+  const name = String(req.body?.name || "").trim().slice(0, 60);
+  const message = String(req.body?.message || "").trim().slice(0, 300);
+  const rating = Math.max(1, Math.min(5, parseInt(req.body?.rating, 10) || 5));
+  if (!name || !message) return res.status(400).json({ error: "Name and message are required." });
+  const { data, error } = await db.from("reviews").insert({ name, message, rating }).select().single();
+  ok(res, error, { review: data }, "Could not save feedback.");
+});
+app.delete("/api/admin/reviews/:id", admin, async (req, res) => {
+  const { error } = await db.from("reviews").delete().eq("id", req.params.id);
+  ok(res, error, { deleted: true }, "Could not delete feedback.");
+});
+
+app.use((err, _req, res, _next) => {
+  console.error(err?.message || "Unexpected server error");
+  res.status(500).json({ error: "Unexpected server error." });
+});
+
+app.listen(port, () => {
+  console.log(`DeeBlaq's Market API listening on port ${port}`);
+});
+!(d.price >= 0)) return res.status(400).json({ error: "Name and a valid price are required." });
+  const { data, error } = await db.from("products").insert({ available: true, is_active: true, ...d }).select().single();
+  ok(res, error, { product: data }, "Could not save product.");
+});
+app.put("/api/admin/products/:id", admin, async (req, res) => {
+  const d = cleanProduct(req.body);
+  if (d.price !== undefined && !(d.price >= 0)) return res.status(400).json({ error: "Invalid price." });
+  const { data, error } = await db.from("products").update(d).eq("id", req.params.id).select().single();
+  ok(res, error, { product: data }, "Could not update product.");
+});
+app.delete("/api/admin/products/:id", admin, async (req, res) => {
+  const { error } = await db.from("products").update({ is_active: false }).eq("id", req.params.id);
+  ok(res, error, { deleted: true }, "Could not delete product.");
+});
+
+/* ---------- Admin: categories ---------- */
+app.post("/api/admin/categories", admin, async (req, res) => {
+  const name = String(req.body?.name || "").trim().slice(0, 80);
+  if (!name) return res.status(400).json({ error: "Category name required." });
+  const { data, error } = await db.from("categories").insert({ name, sort: Number(req.body?.sort) || 0, is_active: true }).select().single();
+  ok(res, error, { category: data }, "Could not save category.");
+});
+app.put("/api/admin/categories/:id", admin, async (req, res) => {
+  const d = pick(req.body, ["name", "sort"]);
+  const { data, error } = await db.from("categories").update(d).eq("id", req.params.id).select().single();
+  ok(res, error, { category: data }, "Could not update category.");
+});
+app.delete("/api/admin/categories/:id", admin, async (req, res) => {
+  const { error } = await db.from("categories").update({ is_active: false }).eq("id", req.params.id);
+  ok(res, error, { deleted: true }, "Could not delete category.");
+});
+
+/* ---------- Customer: deposits ---------- */
+app.post("/api/deposits", requireDb, authenticate, async (req, res) => {
+  const amount = Number(req.body?.amount), reference = String(req.body?.reference || "").trim().slice(0, 120);
+  if (!(amount > 0) || !reference) return res.status(400).json({ error: "Amount and payment reference are required." });
+  const { data, error } = await db.from("deposits").insert({ user_id: req.user.id, amount, reference, status: "pending" }).select().single();
+  ok(res, error, { deposit: data }, "Could not submit deposit.");
+});
+app.get("/api/deposits", requireDb, authenticate, async (req, res) => {
+  const { data, error } = await db.from("deposits").select("*").eq("user_id", req.user.id).order("created_at", { ascending: false });
+  ok(res, error, { deposits: data || [] }, "Could not load deposits.");
+});
+
+/* ---------- Customer: orders (paid from wallet, atomic) ---------- */
+app.post("/api/orders", requireDb, authenticate, async (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 50) : [];
+  if (!items.length) return res.status(400).json({ error: "Your cart is empty." });
+  const ids = items.map((i) => i.product_id);
+  const { data: prods, error } = await db.from("products").select("id,name,price,plans").in("id", ids).eq("is_active", true).eq("available", true);
+  if (error) return res.status(500).json({ error: "Could not check products." });
+  let total = 0; const lines = [];
+  for (const i of items) {
+    const p = (prods || []).find((x) => String(x.id) === String(i.product_id));
+    const qty = Math.max(1, Math.min(20, parseInt(i.qty, 10) || 1));
+    if (!p) return res.status(400).json({ error: "A product in your cart is no longer available." });
+    let price = Number(p.price), name = p.name;
+    const plans = Array.isArray(p.plans) ? p.plans : [];
+    if (plans.length) {
+      const plan = plans.find((x) => x.label === i.plan);
+      if (!plan) return res.status(400).json({ error: "Please choose a plan for " + p.name + "." });
+      price = Number(plan.price); name = p.name + " (" + plan.label + ")";
+    }
+    total += price * qty; lines.push({ product_id: p.id, name, price, qty });
+  }
+  const { error: rpcErr } = await db.rpc("place_order", { p_user: req.user.id, p_items: lines, p_total: total, p_note: String(req.body?.note || "").trim().slice(0, 300) || null });
+  if (rpcErr) return res.status(400).json({ error: /insufficient/i.test(rpcErr.message) ? "Insufficient balance. Deposit funds first." : "Could not place order." });
+  res.status(201).json({ ok: true, total });
+});
+app.get("/api/orders", requireDb, authenticate, async (req, res) => {
+  const { data, error } = await db.from("orders").select("*").eq("user_id", req.user.id).order("created_at", { ascending: false });
+  ok(res, error, { orders: data || [] }, "Could not load orders.");
+});
+
+/* ---------- Admin: deposits & orders ---------- */
+app.get("/api/admin/deposits", admin, async (_req, res) => {
+  const { data, error } = await db.from("deposits").select("*").order("created_at", { ascending: false }).limit(200);
+  ok(res, error, { deposits: data || [] }, "Could not load deposits.");
+});
+app.post("/api/admin/deposits/:id/approve", admin, async (req, res) => {
+  const { error } = await db.rpc("approve_deposit", { p_id: req.params.id });
+  ok(res, error, { approved: true }, "Could not approve (already handled?).");
+});
+app.post("/api/admin/deposits/:id/reject", admin, async (req, res) => {
+  const { error } = await db.from("deposits").update({ status: "rejected" }).eq("id", req.params.id).eq("status", "pending");
+  ok(res, error, { rejected: true }, "Could not reject.");
+});
+app.get("/api/admin/orders", admin, async (_req, res) => {
   const { data, error } = await db.from("orders").select("*").order("created_at", { ascending: false }).limit(200);
   ok(res, error, { orders: data || [] }, "Could not load orders.");
 });
