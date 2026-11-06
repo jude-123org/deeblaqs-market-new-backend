@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -542,4 +543,3 @@ app.use((err, _req, res, _next) => {
 
 app.listen(port, () => {
   console.log(`DeeBlaq's Market API listening on port ${port}`);
-});
