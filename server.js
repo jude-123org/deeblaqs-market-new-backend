@@ -90,19 +90,33 @@ app.get("/api/categories", requireDb, authenticate, async (_req, res) => {
   res.json({ categories: data || [] });
 });
 
+const san = (v) => String(v || "").replace(/[%,()*\\]/g, " ").trim().slice(0, 60);
+const pageOf = (req, size) => { const page = Math.max(1, parseInt(req.query.page, 10) || 1); const from = (page - 1) * size; return { page, from, to: from + size - 1 }; };
+async function stockInfo(ids) {
+  const map = {};
+  if (!ids.length) return map;
+  const { data } = await db.from("stock_summary").select("product_id,plan,available").in("product_id", ids);
+  (data || []).forEach((r) => { (map[r.product_id] = map[r.product_id] || {})[r.plan || ""] = r.available; });
+  return map;
+}
 app.get("/api/products", requireDb, authenticate, async (req, res) => {
+  const size = 24;
+  const { from, to } = pageOf(req, size);
   let query = db
     .from("products")
-    .select("id,category_id,name,price,image_url,description,available,is_active,plans,created_at")
+    .select("id,category_id,name,price,image_url,description,available,is_active,plans,quantity,created_at")
     .eq("is_active", true)
     .eq("available", true)
-    .order("created_at", { ascending: false });
-
+    .order("created_at", { ascending: false })
+    .range(from, to + 1);
   if (req.query.category_id) query = query.eq("category_id", req.query.category_id);
-
+  const q = san(req.query.q);
+  if (q) query = query.ilike("name", "%" + q + "%");
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: "Could not load products." });
-  res.json({ products: data || [] });
+  const list = (data || []).slice(0, size);
+  const info = await stockInfo(list.map((p) => String(p.id)));
+  res.json({ products: list.map((p) => ({ ...p, by_plan: info[String(p.id)] || null })), more: (data || []).length > size });
 });
 
 const authClient = () =>
@@ -230,13 +244,23 @@ const cleanProduct = (b) => {
       .filter((p) => p.label && p.price >= 0);
     if (d.plans.length) d.price = Math.min(...d.plans.map((p) => p.price));
   }
+  if (b?.quantity !== undefined) {
+    const n = b.quantity === "" || b.quantity === null ? null : Math.max(0, Math.floor(Number(b.quantity)));
+    d.quantity = Number.isFinite(n) ? n : null;
+  }
   return d;
 };
 
 /* ---------- Admin: products ---------- */
-app.get("/api/admin/products", admin, async (_req, res) => {
-  const { data, error } = await db.from("products").select("*").eq("is_active", true).order("created_at", { ascending: false });
-  ok(res, error, { products: data || [] }, "Could not load products.");
+app.get("/api/admin/products", admin, async (req, res) => {
+  const size = 50;
+  const { from, to } = pageOf(req, size);
+  let query = db.from("products").select("*").eq("is_active", true).order("created_at", { ascending: false }).range(from, to + 1);
+  const q = san(req.query.q);
+  if (q) query = query.ilike("name", "%" + q + "%");
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: "Could not load products." });
+  res.json({ products: (data || []).slice(0, size), more: (data || []).length > size });
 });
 app.post("/api/admin/products", admin, async (req, res) => {
   const d = cleanProduct(req.body);
@@ -303,10 +327,10 @@ app.post("/api/orders", requireDb, authenticate, async (req, res) => {
       if (!plan) return res.status(400).json({ error: "Please choose a plan for " + p.name + "." });
       price = Number(plan.price); name = p.name + " (" + plan.label + ")";
     }
-    total += price * qty; lines.push({ product_id: p.id, name, price, qty });
+    total += price * qty; lines.push({ product_id: p.id, name, price, qty, plan: plans.length ? String(i.plan) : "" });
   }
   const { error: rpcErr } = await db.rpc("place_order", { p_user: req.user.id, p_items: lines, p_total: total, p_note: String(req.body?.note || "").trim().slice(0, 300) || null });
-  if (rpcErr) return res.status(400).json({ error: /insufficient/i.test(rpcErr.message) ? "Insufficient balance. Deposit funds first." : "Could not place order." });
+  if (rpcErr) return res.status(400).json({ error: /insufficient/i.test(rpcErr.message) ? "Insufficient balance. Deposit funds first." : /out of stock/i.test(rpcErr.message) ? "Sorry, this item just sold out. Please try again or contact support." : "Could not place order." });
   res.status(201).json({ ok: true, total });
 });
 app.get("/api/orders", requireDb, authenticate, async (req, res) => {
@@ -315,9 +339,14 @@ app.get("/api/orders", requireDb, authenticate, async (req, res) => {
 });
 
 /* ---------- Admin: deposits & orders ---------- */
-app.get("/api/admin/deposits", admin, async (_req, res) => {
-  const { data, error } = await db.from("deposits").select("*").order("created_at", { ascending: false }).limit(200);
-  ok(res, error, { deposits: data || [] }, "Could not load deposits.");
+app.get("/api/admin/deposits", admin, async (req, res) => {
+  const size = 50;
+  const { from, to } = pageOf(req, size);
+  let query = db.from("deposits").select("*").order("created_at", { ascending: false }).range(from, to + 1);
+  if (req.query.status) query = query.eq("status", String(req.query.status));
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: "Could not load deposits." });
+  res.json({ deposits: (data || []).slice(0, size), more: (data || []).length > size });
 });
 app.post("/api/admin/deposits/:id/approve", admin, async (req, res) => {
   const { error } = await db.rpc("approve_deposit", { p_id: req.params.id });
@@ -327,9 +356,24 @@ app.post("/api/admin/deposits/:id/reject", admin, async (req, res) => {
   const { error } = await db.from("deposits").update({ status: "rejected" }).eq("id", req.params.id).eq("status", "pending");
   ok(res, error, { rejected: true }, "Could not reject.");
 });
-app.get("/api/admin/orders", admin, async (_req, res) => {
-  const { data, error } = await db.from("orders").select("*, profiles(email,first_name,last_name,phone)").order("created_at", { ascending: false }).limit(200);
-  ok(res, error, { orders: data || [] }, "Could not load orders.");
+app.get("/api/admin/orders", admin, async (req, res) => {
+  const size = 50;
+  const { from, to } = pageOf(req, size);
+  let query = db.from("orders").select("*, profiles(email,first_name,last_name,phone)").order("created_at", { ascending: false }).range(from, to + 1);
+  if (req.query.status) query = query.eq("status", String(req.query.status));
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: "Could not load orders." });
+  res.json({ orders: (data || []).slice(0, size), more: (data || []).length > size });
+});
+app.get("/api/admin/customers", admin, async (req, res) => {
+  const size = 50;
+  const { from, to } = pageOf(req, size);
+  let query = db.from("profiles").select("id,email,first_name,last_name,phone,balance,created_at", { count: "exact" }).order("created_at", { ascending: false }).range(from, to);
+  const q = san(req.query.q);
+  if (q) query = query.or("email.ilike.%" + q + "%,first_name.ilike.%" + q + "%,last_name.ilike.%" + q + "%,phone.ilike.%" + q + "%");
+  const { data, error, count } = await query;
+  if (error) return res.status(500).json({ error: "Could not load customers." });
+  res.json({ customers: data || [], total: count || 0, more: from + (data || []).length < (count || 0) });
 });
 app.put("/api/admin/orders/:id/deliver", admin, async (req, res) => {
   const delivery = String(req.body?.delivery || "").trim().slice(0, 2000);
@@ -414,126 +458,20 @@ app.delete("/api/admin/reviews/:id", admin, async (req, res) => {
   ok(res, error, { deleted: true }, "Could not delete feedback.");
 });
 
-app.use((err, _req, res, _next) => {
-  console.error(err?.message || "Unexpected server error");
-  res.status(500).json({ error: "Unexpected server error." });
+/* ---------- Admin: stock for automatic delivery ---------- */
+app.get("/api/admin/stock", admin, async (_req, res) => {
+  const { data, error } = await db.from("stock_summary").select("product_id,plan,name,total,available").order("available", { ascending: true }).limit(100);
+  if (error) return res.status(500).json({ error: "Could not load stock." });
+  res.json({ stock: data || [] });
 });
-
-app.listen(port, () => {
-  console.log(`DeeBlaq's Market API listening on port ${port}`);
-});
-!(d.price >= 0)) return res.status(400).json({ error: "Name and a valid price are required." });
-  const { data, error } = await db.from("products").insert({ available: true, is_active: true, ...d }).select().single();
-  ok(res, error, { product: data }, "Could not save product.");
-});
-app.put("/api/admin/products/:id", admin, async (req, res) => {
-  const d = cleanProduct(req.body);
-  if (d.price !== undefined && !(d.price >= 0)) return res.status(400).json({ error: "Invalid price." });
-  const { data, error } = await db.from("products").update(d).eq("id", req.params.id).select().single();
-  ok(res, error, { product: data }, "Could not update product.");
-});
-app.delete("/api/admin/products/:id", admin, async (req, res) => {
-  const { error } = await db.from("products").update({ is_active: false }).eq("id", req.params.id);
-  ok(res, error, { deleted: true }, "Could not delete product.");
-});
-
-/* ---------- Admin: categories ---------- */
-app.post("/api/admin/categories", admin, async (req, res) => {
-  const name = String(req.body?.name || "").trim().slice(0, 80);
-  if (!name) return res.status(400).json({ error: "Category name required." });
-  const { data, error } = await db.from("categories").insert({ name, sort: Number(req.body?.sort) || 0, is_active: true }).select().single();
-  ok(res, error, { category: data }, "Could not save category.");
-});
-app.put("/api/admin/categories/:id", admin, async (req, res) => {
-  const d = pick(req.body, ["name", "sort"]);
-  const { data, error } = await db.from("categories").update(d).eq("id", req.params.id).select().single();
-  ok(res, error, { category: data }, "Could not update category.");
-});
-app.delete("/api/admin/categories/:id", admin, async (req, res) => {
-  const { error } = await db.from("categories").update({ is_active: false }).eq("id", req.params.id);
-  ok(res, error, { deleted: true }, "Could not delete category.");
-});
-
-/* ---------- Customer: deposits ---------- */
-app.post("/api/deposits", requireDb, authenticate, async (req, res) => {
-  const amount = Number(req.body?.amount), reference = String(req.body?.reference || "").trim().slice(0, 120);
-  if (!(amount > 0) || !reference) return res.status(400).json({ error: "Amount and payment reference are required." });
-  const { data, error } = await db.from("deposits").insert({ user_id: req.user.id, amount, reference, status: "pending" }).select().single();
-  ok(res, error, { deposit: data }, "Could not submit deposit.");
-});
-app.get("/api/deposits", requireDb, authenticate, async (req, res) => {
-  const { data, error } = await db.from("deposits").select("*").eq("user_id", req.user.id).order("created_at", { ascending: false });
-  ok(res, error, { deposits: data || [] }, "Could not load deposits.");
-});
-
-/* ---------- Customer: orders (paid from wallet, atomic) ---------- */
-app.post("/api/orders", requireDb, authenticate, async (req, res) => {
-  const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 50) : [];
-  if (!items.length) return res.status(400).json({ error: "Your cart is empty." });
-  const ids = items.map((i) => i.product_id);
-  const { data: prods, error } = await db.from("products").select("id,name,price,plans").in("id", ids).eq("is_active", true).eq("available", true);
-  if (error) return res.status(500).json({ error: "Could not check products." });
-  let total = 0; const lines = [];
-  for (const i of items) {
-    const p = (prods || []).find((x) => String(x.id) === String(i.product_id));
-    const qty = Math.max(1, Math.min(20, parseInt(i.qty, 10) || 1));
-    if (!p) return res.status(400).json({ error: "A product in your cart is no longer available." });
-    let price = Number(p.price), name = p.name;
-    const plans = Array.isArray(p.plans) ? p.plans : [];
-    if (plans.length) {
-      const plan = plans.find((x) => x.label === i.plan);
-      if (!plan) return res.status(400).json({ error: "Please choose a plan for " + p.name + "." });
-      price = Number(plan.price); name = p.name + " (" + plan.label + ")";
-    }
-    total += price * qty; lines.push({ product_id: p.id, name, price, qty });
-  }
-  const { error: rpcErr } = await db.rpc("place_order", { p_user: req.user.id, p_items: lines, p_total: total, p_note: String(req.body?.note || "").trim().slice(0, 300) || null });
-  if (rpcErr) return res.status(400).json({ error: /insufficient/i.test(rpcErr.message) ? "Insufficient balance. Deposit funds first." : "Could not place order." });
-  res.status(201).json({ ok: true, total });
-});
-app.get("/api/orders", requireDb, authenticate, async (req, res) => {
-  const { data, error } = await db.from("orders").select("*").eq("user_id", req.user.id).order("created_at", { ascending: false });
-  ok(res, error, { orders: data || [] }, "Could not load orders.");
-});
-
-/* ---------- Admin: deposits & orders ---------- */
-app.get("/api/admin/deposits", admin, async (_req, res) => {
-  const { data, error } = await db.from("deposits").select("*").order("created_at", { ascending: false }).limit(200);
-  ok(res, error, { deposits: data || [] }, "Could not load deposits.");
-});
-app.post("/api/admin/deposits/:id/approve", admin, async (req, res) => {
-  const { error } = await db.rpc("approve_deposit", { p_id: req.params.id });
-  ok(res, error, { approved: true }, "Could not approve (already handled?).");
-});
-app.post("/api/admin/deposits/:id/reject", admin, async (req, res) => {
-  const { error } = await db.from("deposits").update({ status: "rejected" }).eq("id", req.params.id).eq("status", "pending");
-  ok(res, error, { rejected: true }, "Could not reject.");
-});
-app.get("/api/admin/orders", admin, async (_req, res) => {
-  const { data, error } = await db.from("orders").select("*").order("created_at", { ascending: false }).limit(200);
-  ok(res, error, { orders: data || [] }, "Could not load orders.");
-});
-app.put("/api/admin/orders/:id/deliver", admin, async (req, res) => {
-  const { error } = await db.from("orders").update({ status: "delivered" }).eq("id", req.params.id);
-  ok(res, error, { delivered: true }, "Could not update order.");
-});
-
-/* ---------- Customer feedback (public read, admin write) ---------- */
-app.get("/api/reviews", requireDb, async (_req, res) => {
-  const { data, error } = await db.from("reviews").select("id,name,message,rating,created_at").order("created_at", { ascending: false }).limit(30);
-  ok(res, error, { reviews: data || [] }, "Could not load feedback.");
-});
-app.post("/api/admin/reviews", admin, async (req, res) => {
-  const name = String(req.body?.name || "").trim().slice(0, 60);
-  const message = String(req.body?.message || "").trim().slice(0, 300);
-  const rating = Math.max(1, Math.min(5, parseInt(req.body?.rating, 10) || 5));
-  if (!name || !message) return res.status(400).json({ error: "Name and message are required." });
-  const { data, error } = await db.from("reviews").insert({ name, message, rating }).select().single();
-  ok(res, error, { review: data }, "Could not save feedback.");
-});
-app.delete("/api/admin/reviews/:id", admin, async (req, res) => {
-  const { error } = await db.from("reviews").delete().eq("id", req.params.id);
-  ok(res, error, { deleted: true }, "Could not delete feedback.");
+app.post("/api/admin/stock", admin, async (req, res) => {
+  const product_id = String(req.body?.product_id || "").trim();
+  const plan = String(req.body?.plan || "").trim().slice(0, 40);
+  const raw = Array.isArray(req.body?.lines) ? req.body.lines : String(req.body?.lines || "").split("\n");
+  const lines = raw.map((l) => String(l).trim().slice(0, 500)).filter(Boolean).slice(0, 500);
+  if (!product_id || !lines.length) return res.status(400).json({ error: "Choose a product and add at least one line." });
+  const { error } = await db.from("stock").insert(lines.map((details) => ({ product_id, plan, details })));
+  ok(res, error, { added: lines.length }, "Could not add stock.");
 });
 
 app.use((err, _req, res, _next) => {
@@ -543,3 +481,4 @@ app.use((err, _req, res, _next) => {
 
 app.listen(port, () => {
   console.log(`DeeBlaq's Market API listening on port ${port}`);
+});
