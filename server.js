@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -9,6 +8,9 @@ const { createClient } = require("@supabase/supabase-js");
 const app = express();
 app.set("trust proxy", 1);
 app.use(helmet());
+/* Deposits can carry a receipt screenshot, so this route accepts a larger body.
+   It must come before the global parser below. */
+app.use("/api/deposits", express.json({ limit: "1mb" }));
 app.use(express.json({ limit: "100kb" }));
 
 const allowedOrigins = (process.env.FRONTEND_URL || "")
@@ -297,11 +299,24 @@ app.delete("/api/admin/categories/:id", admin, async (req, res) => {
 });
 
 /* ---------- Customer: deposits ---------- */
+const RECEIPT_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
 app.post("/api/deposits", requireDb, authenticate, async (req, res) => {
   const amount = Number(req.body?.amount), reference = String(req.body?.reference || "").trim().slice(0, 120);
   if (!(amount > 0) || !reference) return res.status(400).json({ error: "Amount and payment reference are required." });
+  const receipt = req.body?.receipt ? String(req.body.receipt) : "";
+  if (receipt && (receipt.length > 800000 || !RECEIPT_RE.test(receipt))) {
+    return res.status(400).json({ error: "The receipt image is invalid or too large. Please try a smaller screenshot." });
+  }
   const { data, error } = await db.from("deposits").insert({ user_id: req.user.id, amount, reference, status: "pending" }).select().single();
-  ok(res, error, { deposit: data }, "Could not submit deposit.");
+  if (error) return res.status(500).json({ error: "Could not submit deposit." });
+  if (receipt) {
+    const { error: rErr } = await db.from("deposit_receipts").insert({ deposit_id: String(data.id), image: receipt });
+    if (rErr) {
+      await db.from("deposits").delete().eq("id", data.id).eq("status", "pending");
+      return res.status(500).json({ error: "Could not save your receipt. Please try again." });
+    }
+  }
+  res.json({ deposit: data });
 });
 app.get("/api/deposits", requireDb, authenticate, async (req, res) => {
   const { data, error } = await db.from("deposits").select("*").eq("user_id", req.user.id).order("created_at", { ascending: false });
@@ -346,7 +361,30 @@ app.get("/api/admin/deposits", admin, async (req, res) => {
   if (req.query.status) query = query.eq("status", String(req.query.status));
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: "Could not load deposits." });
-  res.json({ deposits: (data || []).slice(0, size), more: (data || []).length > size });
+  const list = (data || []).slice(0, size);
+
+  /* attach the customer's name and whether a receipt screenshot was uploaded */
+  const userIds = [...new Set(list.map((d) => d.user_id).filter(Boolean))];
+  const people = {};
+  if (userIds.length) {
+    const { data: ps } = await db.from("profiles").select("id,email,first_name,last_name,phone").in("id", userIds);
+    (ps || []).forEach((p) => { people[p.id] = p; });
+  }
+  const withReceipt = new Set();
+  if (list.length) {
+    const { data: rs } = await db.from("deposit_receipts").select("deposit_id").in("deposit_id", list.map((d) => String(d.id)));
+    (rs || []).forEach((r) => withReceipt.add(String(r.deposit_id)));
+  }
+  res.json({
+    deposits: list.map((d) => ({ ...d, profiles: people[d.user_id] || null, has_receipt: withReceipt.has(String(d.id)) })),
+    more: (data || []).length > size
+  });
+});
+app.get("/api/admin/deposits/:id/receipt", admin, async (req, res) => {
+  const { data, error } = await db.from("deposit_receipts").select("image").eq("deposit_id", String(req.params.id)).maybeSingle();
+  if (error) return res.status(500).json({ error: "Could not load the receipt." });
+  if (!data) return res.status(404).json({ error: "No receipt was uploaded for this deposit." });
+  res.json({ receipt: data.image });
 });
 app.post("/api/admin/deposits/:id/approve", admin, async (req, res) => {
   const { error } = await db.rpc("approve_deposit", { p_id: req.params.id });
