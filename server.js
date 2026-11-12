@@ -29,8 +29,10 @@ app.use(cors({
 }));
 
 const port = Number(process.env.PORT || 3000);
-const supabaseUrl = process.env.SUPABASE_URL;
-const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+/* remove accidental spaces or quotes around the hosting values */
+const cleanEnv = (v) => String(v || "").trim().replace(/^["']|["']$/g, "");
+const supabaseUrl = cleanEnv(process.env.SUPABASE_URL);
+const serviceRoleKey = cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 let db;
 if (supabaseUrl && serviceRoleKey) {
@@ -78,7 +80,8 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  /* shows only true/false, never the values */
+  res.json({ ok: true, has_url: Boolean(supabaseUrl), has_service_key: Boolean(serviceRoleKey), configured: Boolean(db) });
 });
 
 app.get("/api/categories", requireDb, authenticate, async (_req, res) => {
@@ -517,6 +520,11 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: "Unexpected server error." });
 });
 
-app.listen(port, () => {
-  console.log(`DeeBlaq's Market API listening on port ${port}`);
-});
+/* Vercel runs the app itself, so only start a server when running elsewhere (Render, your computer) */
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`DeeBlaq's Market API listening on port ${port}`);
+  });
+}
+
+module.exports = app;
