@@ -31,7 +31,9 @@ app.use(cors({
 const port = Number(process.env.PORT || 3000);
 /* remove accidental spaces or quotes around the hosting values */
 const cleanEnv = (v) => String(v || "").trim().replace(/^["']|["']$/g, "");
-const supabaseUrl = cleanEnv(process.env.SUPABASE_URL);
+/* keep only the site address, so a pasted /rest/v1/ or trailing slash can't break it */
+const cleanUrl = (v) => { const s = cleanEnv(v); if (!s) return ""; try { return new URL(s).origin; } catch (e) { return s; } };
+const supabaseUrl = cleanUrl(process.env.SUPABASE_URL);
 const serviceRoleKey = cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 let db;
@@ -184,7 +186,10 @@ app.post("/api/auth/login", requireDb, async (req, res) => {
   if (limited("l:" + email, 10)) return res.status(429).json({ error: "Too many attempts. Try again in a few minutes." });
 
   const { data, error } = await authClient().auth.signInWithPassword({ email, password });
-  if (error) return res.status(401).json({ error: "Email or password is incorrect." });
+  if (error) {
+    console.error("login failed:", error.status || "", error.message);
+    return res.status(401).json({ error: "Email or password is incorrect." });
+  }
 
   res.json({
     access_token: data.session.access_token,
