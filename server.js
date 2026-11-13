@@ -504,6 +504,64 @@ app.delete("/api/admin/reviews/:id", admin, async (req, res) => {
   ok(res, error, { deleted: true }, "Could not delete feedback.");
 });
 
+/* ---------- Admin: website statistics (users joined and money spent) ---------- */
+const LAGOS_OFFSET_MS = 60 * 60 * 1000; /* Nigeria is UTC+1 all year, so "a day" means a Lagos day */
+const dayKey = (t) => new Date(new Date(t).getTime() + LAGOS_OFFSET_MS).toISOString().slice(0, 10);
+const NOT_SPENT = ["cancelled", "canceled", "refunded", "failed", "rejected"];
+function buildStats(users, orders, deposits, now = Date.now(), days = 14) {
+  const keys = [];
+  for (let i = days - 1; i >= 0; i--) keys.push(dayKey(now - i * 86400000));
+  const today = keys[keys.length - 1];
+  const signups = {}, spent = {}, orderCount = {}, funds = {};
+  users.forEach((u) => { if (u.created_at) { const k = dayKey(u.created_at); signups[k] = (signups[k] || 0) + 1; } });
+  let totalSpent = 0, totalOrders = 0;
+  orders.forEach((o) => {
+    if (!o.created_at || NOT_SPENT.includes(String(o.status || "").toLowerCase())) return;
+    const k = dayKey(o.created_at), t = Number(o.total) || 0;
+    spent[k] = (spent[k] || 0) + t; orderCount[k] = (orderCount[k] || 0) + 1;
+    totalSpent += t; totalOrders += 1;
+  });
+  let totalFunds = 0;
+  deposits.forEach((d) => {
+    if (!d.created_at) return;
+    const k = dayKey(d.created_at), a = Number(d.amount) || 0;
+    funds[k] = (funds[k] || 0) + a; totalFunds += a;
+  });
+  const sum = (map, list) => list.reduce((a, k) => a + (map[k] || 0), 0);
+  const last7 = keys.slice(-7);
+  return {
+    users: { total: users.length, today: signups[today] || 0, last7: sum(signups, last7) },
+    spending: { total: totalSpent, today: spent[today] || 0, last7: sum(spent, last7), orders_total: totalOrders, orders_today: orderCount[today] || 0 },
+    funds: { total: totalFunds, today: funds[today] || 0 },
+    daily: keys.map((k) => ({ date: k, signups: signups[k] || 0, spent: spent[k] || 0, orders: orderCount[k] || 0, funds: funds[k] || 0 })).reverse()
+  };
+}
+async function fetchAll(table, columns, filter) {
+  const rows = [];
+  for (let from = 0; from < 50000; from += 1000) {
+    let q = db.from(table).select(columns).order("created_at", { ascending: false }).range(from, from + 999);
+    if (filter) q = filter(q);
+    const { data, error } = await q;
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return rows;
+}
+app.get("/api/admin/stats", admin, async (_req, res) => {
+  try {
+    const [users, orders, deposits] = await Promise.all([
+      fetchAll("profiles", "created_at"),
+      fetchAll("orders", "total,status,created_at"),
+      fetchAll("deposits", "amount,status,created_at", (q) => q.eq("status", "approved"))
+    ]);
+    res.json(buildStats(users, orders, deposits));
+  } catch (e) {
+    console.error("stats failed:", e?.message || "");
+    res.status(500).json({ error: "Could not load statistics." });
+  }
+});
+
 /* ---------- Admin: stock for automatic delivery ---------- */
 app.get("/api/admin/stock", admin, async (_req, res) => {
   const { data, error } = await db.from("stock_summary").select("product_id,plan,name,total,available").order("available", { ascending: true }).limit(100);
